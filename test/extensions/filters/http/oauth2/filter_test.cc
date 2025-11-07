@@ -76,6 +76,7 @@ public:
   MOCK_METHOD(std::string&, username, (), (const));
   MOCK_METHOD(std::string&, token, (), (const));
   MOCK_METHOD(std::string&, refreshToken, (), (const));
+  MOCK_METHOD(std::string&, idToken, (), (const));
 
   MOCK_METHOD(bool, canUpdateTokenByRefreshToken, (), (const));
   MOCK_METHOD(bool, isValid, (), (const));
@@ -157,7 +158,10 @@ public:
           ::envoy::extensions::filters::http::oauth2::v3::CookieConfig_SameSite::
               CookieConfig_SameSite_DISABLED,
       int csrf_token_expires_in = 0, int code_verifier_token_expires_in = 0,
-      bool disable_token_encryption = false) {
+      bool disable_token_encryption = false,
+      ::envoy::extensions::filters::http::oauth2::v3::OAuth2Config_TokenType token_type =
+        ::envoy::extensions::filters::http::oauth2::v3::OAuth2Config_TokenType::OAuth2Config_TokenType_ACCESS_TOKEN
+    ) {
 
     envoy::extensions::filters::http::oauth2::v3::OAuth2Config p;
     auto* endpoint = p.mutable_token_endpoint();
@@ -174,6 +178,7 @@ public:
     p.set_disable_access_token_set_cookie(disable_access_token_set_cookie);
     p.set_disable_refresh_token_set_cookie(disable_refresh_token_set_cookie);
     p.set_stat_prefix("my_prefix");
+    p.set_forward_bearer_token_type(token_type);
 
     auto* useRefreshToken = p.mutable_use_refresh_token();
     useRefreshToken->set_value(use_refresh_token);
@@ -3889,6 +3894,55 @@ TEST_F(OAuth2Test, SecureAttributeAddedForSecureCookiePrefixesOnSignout) {
   run_test_with_prefix("__Secure-", true);
   run_test_with_prefix("__Host-", true);
   run_test_with_prefix("", false);
+}
+
+/**
+ * Testing that the accessToken is send back to upstream with no specific config.
+ *
+ * Expected behavior: Bearer Token should be the Access Token.
+ */
+TEST_F(OAuth2Test, BearerTokenIsAccessTokenWhenForwardedBearerIsSetWithNoType) {
+    constexpr auto DisabledSameSite = ::envoy::extensions::filters::http::oauth2::v3::
+      CookieConfig_SameSite::CookieConfig_SameSite_DISABLED;    
+    FilterConfigSharedPtr config = getConfig(true /* forward_bearer_token */,false,
+                 ::envoy::extensions::filters::http::oauth2::v3::OAuth2Config_AuthType::OAuth2Config_AuthType_BASIC_AUTH,
+                 0, false, false, false, false, false, DisabledSameSite, DisabledSameSite,
+                 DisabledSameSite, DisabledSameSite, DisabledSameSite, DisabledSameSite,
+                 DisabledSameSite, 0, 0, false, 
+                 ::envoy::extensions::filters::http::oauth2::v3::OAuth2Config_TokenType::OAuth2Config_TokenType_ACCESS_TOKEN );
+    init(config);
+  
+  Http::TestRequestHeaderMapImpl mock_request_headers{
+      {Http::Headers::get().Path.get(), "/anypath"},
+      {Http::Headers::get().Host.get(), "traffic.example.com"},
+      {Http::Headers::get().Method.get(), Http::Headers::get().MethodValues.Get},
+      {Http::Headers::get().Scheme.get(), "https"},
+      {Http::CustomHeaders::get().Authorization.get(), "Bearer injected_malice!"},
+  };
+
+  Http::TestRequestHeaderMapImpl expected_headers{
+      {Http::Headers::get().Path.get(), "/anypath"},
+      {Http::Headers::get().Host.get(), "traffic.example.com"},
+      {Http::Headers::get().Method.get(), Http::Headers::get().MethodValues.Get},
+      {Http::Headers::get().Scheme.get(), "https"},
+      {Http::CustomHeaders::get().Authorization.get(), "Bearer access_token"},
+  };
+
+  filter_->onGetAccessTokenSuccess("access_token", "some-id-token", "some-refresh-token",
+                                   std::chrono::seconds(600));
+
+  // cookie-validation mocking
+  EXPECT_CALL(*validator_, setParams(_, _));
+  EXPECT_CALL(*validator_, isValid()).WillOnce(Return(true));
+
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue,
+            filter_->decodeHeaders(mock_request_headers, false));
+
+  // Ensure that existing OAuth forwarded headers got sanitized.
+  EXPECT_EQ(mock_request_headers, expected_headers);
+
+  EXPECT_EQ(scope_.counterFromString("test.my_prefix.oauth_failure").value(), 0);
+  EXPECT_EQ(scope_.counterFromString("test.my_prefix.oauth_success").value(), 1);
 }
 
 } // namespace Oauth2
